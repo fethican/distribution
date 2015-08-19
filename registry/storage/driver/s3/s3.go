@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -716,14 +717,88 @@ func (d *driver) List(ctx context.Context, path string) ([]string, error) {
 	return append(files, directories...), nil
 }
 
+const minMultipartSize = 5 << 30
+
 // Move moves an object stored at sourcePath to destPath, removing the original
 // object.
 func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) error {
-	/* This is terrible, but aws doesn't have an actual move. */
-	_, err := d.Bucket.PutCopy(d.s3Path(destPath), getPermissions(),
-		s3.CopyOptions{Options: d.getOptions(), ContentType: d.getContentType()}, d.Bucket.Name+"/"+d.s3Path(sourcePath))
+	resp, err := d.Bucket.Head(d.s3Path(sourcePath), nil)
+
 	if err != nil {
-		return parseError(sourcePath, err)
+		// discard error
+	}
+
+	contentSize := int64(resp.ContentLength)
+	logrus.Info("CONTENT SIZE: ", contentSize)
+	if contentSize < minMultipartSize {
+		logrus.Info("S3 SINGLE MOVE")
+		// File size below 5GB, use normal copy
+
+		/* This is terrible, but aws doesn't have an actual move. */
+		_, err := d.Bucket.PutCopy(d.s3Path(destPath), getPermissions(),
+			s3.CopyOptions{Options: d.getOptions(), ContentType: d.getContentType()}, d.Bucket.Name+"/"+d.s3Path(sourcePath))
+		if err != nil {
+			return parseError(sourcePath, err)
+		}
+	} else {
+		// file size above 5GB, use multi-part copy
+		logrus.Info("S3 MULTIPART MOVE")
+		parts := []s3.Part{}
+
+		multi, err := d.Bucket.InitMulti(d.s3Path(destPath), d.getContentType(), getPermissions(), d.getOptions())
+		if err != nil {
+			// TODO: review(fethican)
+			return err
+		}
+
+		// Cleanup dangling multipart copy.
+		defer func() {
+			if len(parts) > 0 {
+				if multi == nil {
+					panic("Unreachable")
+				} else {
+					if multi.Complete(parts) != nil {
+						multi.Abort()
+					}
+				}
+			}
+		}()
+
+		copyPart := func(n int, first int64, last int64, source string) error {
+			opts := s3.CopyOptions{
+				CopySourceOptions: fmt.Sprintf("bytes=%d-%d", first, last),
+			}
+
+			_, part, err := multi.PutPartCopy(n, opts, source)
+			if err != nil {
+				return err
+			}
+
+			parts = append(parts, part)
+			return nil
+		}
+
+		minCopyChunkSize := 5 << 20
+		iter := int(math.Ceil(float64(contentSize) / float64(minCopyChunkSize)))
+
+		first := int64(0)
+		last := int64(0)
+
+		for i := 1; i <= iter; i++ {
+			first = int64(minCopyChunkSize * (i - 1))
+			last = int64((minCopyChunkSize * i) - 1)
+
+			if last > contentSize {
+				last = contentSize - 1
+			}
+
+			fmt.Printf("Part %d: %d-%d\n", i, first, last)
+			if err := copyPart(i, first, last, fmt.Sprintf("%s/%s", d.Bucket.Name, d.s3Path(sourcePath))); err != nil {
+				logrus.Errorf("S3 multipart copy returned error, aborting: %v", err)
+				return parseError(sourcePath, err)
+			}
+		}
+
 	}
 
 	return d.Delete(ctx, sourcePath)
