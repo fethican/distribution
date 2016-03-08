@@ -778,7 +778,7 @@ func (d *driver) Move(ctx context.Context, sourcePath string, destPath string) e
 			return nil
 		}
 
-		minCopyChunkSize := 5 << 20
+		minCopyChunkSize := 5 << 29
 		iter := int(math.Ceil(float64(contentSize) / float64(minCopyChunkSize)))
 
 		first := int64(0)
